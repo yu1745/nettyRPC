@@ -12,8 +12,10 @@ import io.netty.handler.codec.ReplayingDecoder;
 import io.netty.util.concurrent.Promise;
 import lombok.SneakyThrows;
 
+import java.io.ByteArrayInputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -27,15 +29,15 @@ public class Server {
     private static final Object NULL = new Object();
     //    private static final int PORT = 8080;
     private final int port;
-    private final Map<String, ServiceWrapper> m = new ConcurrentHashMap<>();
+    private final Map<String, ServiceWrapper> serviceWrapperMap = new ConcurrentHashMap<>();
     private final ExecutorService exe = Executors.newCachedThreadPool();
 
     private final EventLoopGroup bossGroup = new NioEventLoopGroup(1);
 //    private final EventLoopGroup workerGroup = new NioEventLoopGroup();
 
     private static class ServiceWrapper {
-        Method[] methods;
-        Object service;
+        final Method[] methods;
+        final Object service;
 
         public ServiceWrapper(Class<?> c, Object service) {
             methods = c.getMethods();
@@ -65,20 +67,46 @@ public class Server {
                         p.addLast(new ReplayingDecoder<Client.Request>() {
                             @Override
                             protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
-                                int len = in.readInt();
-                                ByteBuf byteBuf = in.readBytes(len);
-                                byte[] bytes = new byte[len];
-                                byteBuf.readBytes(bytes);
-                                Client.Request request = mapper.readValue(bytes, Client.Request.class);
+                                int reqLen = in.readInt();
+                                ByteBuf reqBuf = in.readBytes(reqLen);
+                                byte[] reqBytes = new byte[reqLen];
+                                reqBuf.readBytes(reqBytes);
+                                reqBuf.release();
+                                int argsLen = in.readInt();
+                                if (argsLen == 0) {
+                                    Client.Request request = mapper.readValue(reqBytes, Client.Request.class);
+                                    out.add(request);
+                                    return;
+                                }
+                                ByteBuf argsBuf = in.readBytes(argsLen);
+                                byte[] argsBytes = new byte[argsLen];
+                                argsBuf.readBytes(argsBytes);
+                                argsBuf.release();
+                                Client.Request request = mapper.readValue(reqBytes, Client.Request.class);
+                                ServiceWrapper serviceWrapper = serviceWrapperMap.get(request.clazz);
+                                Method method = serviceWrapper.methods[request.methodIndex];
+                                Class<?>[] parameterTypes = method.getParameterTypes();
+                                ByteArrayInputStream inputStream = new ByteArrayInputStream(argsBytes);
+                                List<Object> args = new ArrayList<>();
+                                for (Class<?> type : parameterTypes) {
+                                    args.add(mapper.readValue(inputStream, type));
+                                }
+                                request.args = args.toArray();
                                 out.add(request);
-                                byteBuf.release();
+                            }
+
+                            @Override
+                            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+                                System.out.println("Server.exceptionCaught");
+                                cause.printStackTrace();
+                                ctx.channel().close();
                             }
                         });
                         p.addLast(new SimpleChannelInboundHandler<Client.Request>() {
                             @Override
                             protected void channelRead0(ChannelHandlerContext ctx, Client.Request request) {
                                 Promise<Object> promise = ctx.executor().newPromise();
-                                ServiceWrapper serviceWrapper = m.get(request.clazz);
+                                ServiceWrapper serviceWrapper = serviceWrapperMap.get(request.clazz);
                                 exe.submit(() -> {
                                     try {
                                         Object o = serviceWrapper.methods[request.methodIndex].invoke(serviceWrapper.service, request.args);
@@ -96,20 +124,6 @@ public class Server {
                                     }
                                 });
                             }
-
-                            /*@Override
-                            protected void channelRead0(ChannelHandlerContext ctx, Object[] msg) throws Exception {
-//                                System.out.println("Server.channelRead0");
-                                Promise<Object> promise = ctx.executor().newPromise();
-                                ctx.executor().submit(() -> {
-                                    promise.setSuccess("nmsl111");
-                                });
-
-                                promise.addListener((FutureListener<Object>) future -> {
-                                    Object o = future.get();
-                                    ctx.channel().writeAndFlush(o);
-                                });
-                            }*/
                         });
                         p.addLast(new MessageToByteEncoder<Object>() {
                             @Override
@@ -130,6 +144,6 @@ public class Server {
     }
 
     public void register(Class<?> c, Object o) {
-        m.put(c.getName(), new ServiceWrapper(c, o));
+        serviceWrapperMap.put(c.getName(), new ServiceWrapper(c, o));
     }
 }

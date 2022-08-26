@@ -16,9 +16,7 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.*;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -29,7 +27,7 @@ public class Client {
     //rpc调用返回为null时的标记对象
     private static final Object NULL = new Object();
     private final ExecutorService exe = Executors.newCachedThreadPool();
-    private final Map<Channel, Request> requestMap = new HashMap<>();
+    private final Map<Channel, Request> requestMap = new ConcurrentHashMap<>();
 
 
     private class InvokeHandler implements InvocationHandler {
@@ -40,7 +38,7 @@ public class Client {
         }
 
         //连接池
-        private final Deque<Connection> deque = new ArrayDeque<>();
+        private final Deque<Connection> deque = new ConcurrentLinkedDeque<>();
         //method映射到int
         private final Map<Method, Integer> methodIntegerMap = new HashMap<>();
         final ReentrantLock lock = new ReentrantLock();
@@ -70,18 +68,38 @@ public class Client {
                         channel.writeAndFlush(request);
                     });
                     //防止永久阻塞
-                    //noinspection ResultOfMethodCallIgnored
-                    condition.await(1, TimeUnit.SECONDS);
-                    deque.offer(new Connection(request.channel, condition));
+                    if (!condition.await(10, TimeUnit.SECONDS)) {
+                        // 超时
+                        System.out.println(request + " 超时");
+                        if (request.channel != null) {
+                            //已经建立了连接，需要销毁连接和request
+                            requestMap.remove(request.channel);
+                            request.channel.close();
+                        }
+                    } else {
+                        // 不超时
+                        if (request.channel != null) {
+                            deque.offer(new Connection(request.channel, condition));
+                        }
+                    }
                     return request.rt;
                 } else {
                     //复用连接
                     Request request = new Request(args, method.getDeclaringClass().getName(), methodIntegerMap.get(method), method, poll.condition, lock);
                     poll.channel.writeAndFlush(request);
                     //防止永久阻塞
-                    //noinspection ResultOfMethodCallIgnored
-                    poll.condition.await(1, TimeUnit.SECONDS);
-                    deque.offer(poll);
+                    if (!poll.condition.await(1, TimeUnit.SECONDS)) {
+                        // 超时
+                        System.out.println(request + " 超时");
+                        if (request.channel != null) {
+                            //已经建立了连接，需要销毁连接和request
+                            requestMap.remove(request.channel);
+                            request.channel.close();
+                        }
+                    } else {
+                        // 不超时
+                        deque.offer(poll);
+                    }
                     return request.rt;
                 }
             } finally {
@@ -93,6 +111,7 @@ public class Client {
 
     @Getter
     @NoArgsConstructor
+    @ToString
     protected static class Request {
         public Request(Object[] args, String clazz, int methodIndex, Method method, Condition condition, ReentrantLock lock) {
             this.args = args;
@@ -103,6 +122,7 @@ public class Client {
             this.lock = lock;
         }
 
+        @JsonIgnore
         Object[] args;
         String clazz;
         int methodIndex;
@@ -143,8 +163,19 @@ public class Client {
                     @Override
                     protected void encode(ChannelHandlerContext ctx, Request request, ByteBuf out) throws Exception {
                         requestMap.put(ctx.channel(), request);
-                        byte[] bytes = mapper.writeValueAsBytes(request);
-                        out.writeInt(bytes.length).writeBytes(bytes);
+                        byte[] reqBytes = mapper.writeValueAsBytes(request);
+                        out.writeInt(reqBytes.length).writeBytes(reqBytes);
+                        ArrayList<byte[]> args = new ArrayList<>();
+                        if (request.args != null) {
+                            for (Object arg : request.args) {
+                                args.add(mapper.writeValueAsBytes(arg));
+                            }
+                            Integer len = args.stream().map(e -> e.length).reduce(0, Integer::sum);
+                            out.writeInt(len);
+                            args.forEach(out::writeBytes);
+                        } else {
+                            out.writeInt(0);
+                        }
                     }
                 });
                 p.addLast(new ReplayingDecoder<Object>() {
@@ -159,9 +190,30 @@ public class Client {
                         ByteBuf byteBuf = in.readBytes(len);
                         byte[] bytes = new byte[len];
                         byteBuf.readBytes(bytes);
-                        Object object = mapper.readValue(bytes, request.getMethod().getReturnType());
+                        Object object = mapper.readValue(bytes, request.method.getReturnType());
                         out.add(object);
                         byteBuf.release();
+                    }
+
+                    @Override
+                    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+//                        cause.printStackTrace();
+                        ctx.channel().close();
+                        Request request = requestMap.remove(ctx.channel());
+                        request.lock.lock();
+                        request.condition.signal();
+                        request.lock.unlock();
+                    }
+
+                    @Override
+                    public void channelInactive(ChannelHandlerContext ctx) {
+                        ctx.channel().close();
+                        Request request = requestMap.remove(ctx.channel());
+                        if (request != null) {
+                            request.lock.lock();
+                            request.condition.signal();
+                            request.lock.unlock();
+                        }
                     }
                 });
                 p.addLast(new SimpleChannelInboundHandler<Object>() {

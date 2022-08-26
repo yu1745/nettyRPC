@@ -10,7 +10,10 @@ import org.junit.jupiter.api.Test;
 import java.util.Collections;
 import java.util.List;
 import java.util.Vector;
-import java.util.concurrent.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class TestRPC {
@@ -19,12 +22,13 @@ public class TestRPC {
     public interface ITest {
         String test(String s);
 
-        String null_(String s);
+        String null_();
 
         int identify(int a);
 
         void A(A a);
     }
+
 
 
     public static class ITestImpl implements ITest {
@@ -36,7 +40,7 @@ public class TestRPC {
         }
 
         @Override
-        public String null_(String s) {
+        public String null_() {
             return null;
         }
 
@@ -50,7 +54,11 @@ public class TestRPC {
             System.out.println(a.toString());
         }
 
-
+        @Override
+        public String toString() {
+            System.out.println("ITestImpl.toString");
+            return "toString";
+        }
     }
 
     @AllArgsConstructor
@@ -62,19 +70,35 @@ public class TestRPC {
         byte[] c;
     }
 
+    @Test
+    void normal() {
+        System.out.println("TestRPC.normal");
+        Client client = new Client();
+        ITest service = client.getService(ITest.class);
+        System.out.println("service.identify(1) = " + service.identify(1));
+    }
 
     @Test
-    public void qps() throws InterruptedException {
+    public void qps() {
+        System.out.println("TestRPC.qps");
         Client client = new Client();
         ITest ITest = client.getService(ITest.class);
         AtomicInteger integer = new AtomicInteger();
-        for (int i = 0; i < 1/*Runtime.getRuntime().availableProcessors()*/; i++) {
-            new Thread(() -> {
-                for (int j = 0; j < Integer.MAX_VALUE; j++) {
-                    ITest.test("");
+        int num = 2 << 20;
+        int threads = 1;
+        StringBuilder sb = new StringBuilder();
+        @SuppressWarnings("unchecked") CompletableFuture<Void>[] futures = new CompletableFuture[threads];
+        for (int i = 0; i < (2 << 10); i++) {
+            sb.append('a');
+        }
+        String s = sb.toString();
+        for (int i = 0; i < threads; i++) {
+            futures[i] = CompletableFuture.runAsync(() -> {
+                for (int j = 0; j < num; j++) {
+                    ITest.test(s);
                     integer.incrementAndGet();
                 }
-            }).start();
+            });
         }
         new Thread(() -> {
             while (true) {
@@ -82,37 +106,44 @@ public class TestRPC {
                     int i = integer.get();
                     TimeUnit.SECONDS.sleep(1);
                     System.out.println(integer.get() - i);
+                    if (integer.get() - i == 0) {
+                        return;
+                    }
                 } catch (InterruptedException e) {
                     throw new RuntimeException(e);
                 }
             }
         }).start();
-        new CountDownLatch(1).await();
+        CompletableFuture.allOf(futures).join();
     }
 
 
     @Test
-    public void sync() throws InterruptedException {
+    public void sync() {
+        System.out.println("TestRPC.sync");
         Client client = new Client();
         ITest ITest = client.getService(ITest.class);
-        new Thread(() -> {
-            for (int i = 0; i < Integer.MAX_VALUE / 2; i++) {
+        int num = 2 << 14;
+        ExecutorService service = Executors.newCachedThreadPool();
+        CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+            for (int i = 0; i < num; i++) {
                 Assertions.assertEquals(i, ITest.identify(i));
             }
-        }).start();
-        new Thread(() -> {
-            for (int i = Integer.MAX_VALUE / 2; i < Integer.MAX_VALUE; i++) {
+        }, service);
+        CompletableFuture<Void> future1 = CompletableFuture.runAsync(() -> {
+            for (int i = num; i < num * 2; i++) {
                 Assertions.assertEquals(i, ITest.identify(i));
             }
-        }).start();
-        new CountDownLatch(1).await();
+        }, service);
+        CompletableFuture.allOf(future, future1).join();
     }
 
     @Test
-    public void bootTime() throws InterruptedException {
+    public void bootTime() {
+        System.out.println("TestRPC.bootTime");
         Client client = new Client();
         ITest ITest = client.getService(ITest.class);
-        int num = 40000;
+        int num = 1000;
         List<Double> list = new Vector<>(num);
         ExecutorService service = Executors.newCachedThreadPool();
         @SuppressWarnings("unchecked") CompletableFuture<Void>[] futures = new CompletableFuture[num];
@@ -126,11 +157,26 @@ public class TestRPC {
         CompletableFuture.allOf(futures).join();
         Collections.sort(list);
         System.out.println(list.get(list.size() - 1) - list.get(0));
-        new CountDownLatch(1).await();
     }
 
     @Test
-    public void args() {
+//    @Disabled
+    public void hugeConnections() {
+        System.out.println("TestRPC.hugeConnections");
+        Client client = new Client();
+        ITest ITest = client.getService(ITest.class);
+        int num = 10000;
+        ExecutorService service = Executors.newCachedThreadPool();
+        @SuppressWarnings("unchecked") CompletableFuture<Void>[] futures = new CompletableFuture[num];
+        for (int i = 0; i < num; i++) {
+            int finalI = i;
+            futures[i] = CompletableFuture.runAsync(() -> ITest.identify(finalI), service);
+        }
+        CompletableFuture.allOf(futures).join();
+    }
+
+    @Test
+    void args() {
         ITest service = new Client().getService(ITest.class);
         service.A(new A("dass", 1, new byte[]{1, 2, 34, 5}));
     }
@@ -143,14 +189,19 @@ public class TestRPC {
     }
 
     @Test
-    public void testNull() {
+    void testNull() {
         ITest service = new Client().getService(ITest.class);
-        Assertions.assertNull(service.null_(""));
+        Assertions.assertNull(service.null_());
     }
 
+    /*@Test
+    void toString_(){
+        ITest service = new Client().getService(ITest.class);
+        Assertions.assertEquals(service.toString(),"toString");
+    }*/
 
     /*@Test
-    public void a() throws JsonProcessingException {
+    void a() throws JsonProcessingException {
         @Data
         class A {
             String a = "nmsl";
@@ -162,7 +213,7 @@ public class TestRPC {
     }
 
     @Test
-    public void argsName() throws NoSuchMethodException {
+    void argsName() throws NoSuchMethodException {
         class A {
             public void a(String s, int i, double[] doubles) {
             }

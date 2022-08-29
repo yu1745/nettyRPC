@@ -29,6 +29,8 @@ public class Client {
     private final ExecutorService exe = Executors.newCachedThreadPool();
     private final Map<Channel, Request> requestMap = new ConcurrentHashMap<>();
 
+    private final Deque<InvokeHandler.Connection> deque = new ConcurrentLinkedDeque<>();
+
 
     private class InvokeHandler implements InvocationHandler {
         @AllArgsConstructor
@@ -38,7 +40,6 @@ public class Client {
         }
 
         //连接池
-        private final Deque<Connection> deque = new ConcurrentLinkedDeque<>();
         //method映射到int
         private final Map<Method, Integer> methodIntegerMap = new HashMap<>();
         final ReentrantLock lock = new ReentrantLock();
@@ -68,7 +69,7 @@ public class Client {
                         channel.writeAndFlush(request);
                     });
                     //防止永久阻塞
-                    if (!condition.await(10, TimeUnit.SECONDS)) {
+                    if (!condition.await(3, TimeUnit.SECONDS)) {
                         // 超时
                         System.out.println(request + " 超时");
                         if (request.channel != null) {
@@ -88,7 +89,7 @@ public class Client {
                     Request request = new Request(args, method.getDeclaringClass().getName(), methodIntegerMap.get(method), method, poll.condition, lock);
                     poll.channel.writeAndFlush(request);
                     //防止永久阻塞
-                    if (!poll.condition.await(1, TimeUnit.SECONDS)) {
+                    if (!poll.condition.await(3, TimeUnit.SECONDS)) {
                         // 超时
                         System.out.println(request + " 超时");
                         if (request.channel != null) {
@@ -221,17 +222,17 @@ public class Client {
                     protected void channelRead0(ChannelHandlerContext ctx, Object msg) {
                         Request request = requestMap.remove(ctx.channel());
                         exe.submit(() -> {
-                            try {
-                                request.lock.lock();
-                                if (msg == NULL) {
-                                    request.setRt(null);
-                                } else {
-                                    request.setRt(msg);
-                                }
-                                request.condition.signal();
-                            } finally {
-                                request.lock.unlock();
+//                            try {
+                            request.lock.lock();
+                            if (msg == NULL) {
+                                request.setRt(null);
+                            } else {
+                                request.setRt(msg);
                             }
+                            request.condition.signal();
+//                            } finally {
+                            request.lock.unlock();
+//                            }
                         });
                     }
                 });
